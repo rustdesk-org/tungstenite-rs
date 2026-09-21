@@ -175,15 +175,17 @@ impl FrameCodec {
                 bytes::Buf::advance(&mut self.in_buffer, advanced as _);
 
                 if let Some((_, len)) = &self.header {
-                    let len = *len as usize;
-
-                    // Enforce frame size limit early
-                    if len > max_size {
+                    // Enforce frame size limit early. Compare in u64 before
+                    // narrowing so a length above usize::MAX can't wrap on
+                    // 32-bit/wasm32 targets and slip past the check.
+                    if *len > max_size as u64 {
                         return Err(Error::Capacity(CapacityError::MessageTooLong {
-                            size: len,
+                            size: *len as usize,
                             max_size,
                         }));
                     }
+
+                    let len = *len as usize;
 
                     // Grow with the bytes that actually arrive: a header alone must
                     // not buy the peer an allocation the size it declares.
@@ -291,12 +293,11 @@ impl FrameCodec {
 
 #[cfg(test)]
 mod tests {
-
     use crate::error::{CapacityError, Error};
 
     use super::{Frame, FrameCodec, FrameSocket};
 
-    use std::io::Cursor;
+    use std::io::{self, Cursor, ErrorKind, Read};
 
     #[test]
     fn read_frames() {
@@ -362,6 +363,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn length_above_usize_max_rejected() {
+        // 64-bit payload length 0x1_0000_0005 does not fit a 32-bit usize; it
+        // must be rejected rather than wrapping to 5 when narrowed.
+        let raw = Cursor::new(vec![
+            0x82, 0x7f, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05,
+        ]);
+        let mut sock = FrameSocket::new(raw);
+
+        assert!(matches!(
+            sock.read(None),
+            Err(Error::Capacity(CapacityError::MessageTooLong {
+                size: 5,
+                max_size: usize::MAX
+            }))
+        ));
+    }
+
     fn frame_header(len: usize) -> Vec<u8> {
         // FIN + binary, unmasked, 64-bit extended length.
         let mut raw = vec![0x82, 0x7f];
@@ -369,13 +389,89 @@ mod tests {
         raw
     }
 
+    fn capacity_after_header_only(declared: usize, chunk: usize) -> usize {
+        let mut stream = Cursor::new(frame_header(declared));
+        let mut codec = FrameCodec::new(chunk);
+
+        assert!(codec
+            .read_frame(&mut stream, None, false, true)
+            .unwrap()
+            .is_none());
+
+        codec.in_buffer.capacity()
+    }
+
     #[test]
     fn header_alone_reserves_a_chunk_not_the_declared_length() {
-        let declared = 2 * 1024 * 1024;
-        let mut stream = Cursor::new(frame_header(declared));
-        let mut codec = FrameCodec::new(8 * 1024);
-        assert!(codec.read_frame(&mut stream, None, false, true).unwrap().is_none());
-        assert!(codec.in_buffer.capacity() < declared);
+        const CHUNK: usize = 8 * 1024;
+
+        let capacity_2m = capacity_after_header_only(2 * 1024 * 1024, CHUNK);
+        let capacity_512m = capacity_after_header_only(512 * 1024 * 1024, CHUNK);
+
+        // Allocation must be determined by the read chunk, not by the
+        // peer-controlled frame length.
+        assert_eq!(capacity_2m, capacity_512m);
+
+        // Allow allocator rounding/growth, but make sure a header alone cannot
+        // cause a remotely significant allocation.
+        assert!(
+            capacity_512m <= 16 * CHUNK,
+            "header-only allocation unexpectedly large: {capacity_512m}"
+        );
+    }
+
+    struct HeaderThenWouldBlock {
+        header: Cursor<Vec<u8>>,
+    }
+
+    impl HeaderThenWouldBlock {
+        fn new(header: Vec<u8>) -> Self {
+            Self { header: Cursor::new(header) }
+        }
+    }
+
+    impl Read for HeaderThenWouldBlock {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.header.position() < self.header.get_ref().len() as u64 {
+                self.header.read(buf)
+            } else {
+                Err(io::Error::from(ErrorKind::WouldBlock))
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_would_block_does_not_keep_growing_in_buffer() {
+        const CHUNK: usize = 8 * 1024;
+
+        let declared = 512 * 1024 * 1024;
+        let mut stream = HeaderThenWouldBlock::new(frame_header(declared));
+        let mut codec = FrameCodec::new(CHUNK);
+
+        let result = codec.read_frame(&mut stream, None, false, true);
+        assert!(matches!(
+            result,
+            Err(Error::Io(ref err)) if err.kind() == ErrorKind::WouldBlock
+        ));
+
+        let capacity = codec.in_buffer.capacity();
+
+        // Retrying after WouldBlock must reuse the already allocated capacity,
+        // rather than growing by another read chunk on every call.
+        for _ in 0..16 {
+            let result = codec.read_frame(&mut stream, None, false, true);
+
+            assert!(matches!(
+                result,
+                Err(Error::Io(ref err)) if err.kind() == ErrorKind::WouldBlock
+            ));
+
+            assert_eq!(
+                codec.in_buffer.capacity(),
+                capacity,
+                "in_buffer grew after repeated WouldBlock"
+            );
+        }
     }
 
     #[test]
@@ -384,9 +480,12 @@ mod tests {
         let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
         let mut raw = frame_header(len);
         raw.extend_from_slice(&payload);
+
         let mut stream = Cursor::new(raw);
         let mut codec = FrameCodec::new(8 * 1024);
+
         let frame = codec.read_frame(&mut stream, None, false, true).unwrap().unwrap();
+
         assert_eq!(&frame.into_payload()[..], &payload[..]);
     }
 }
