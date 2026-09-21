@@ -185,9 +185,9 @@ impl FrameCodec {
                         }));
                     }
 
-                    // Reserve full message length only once, even for multiple
-                    // loops or if WouldBlock errors cause multiple fn calls.
-                    self.in_buffer.reserve(len);
+                    // Grow with the bytes that actually arrive: a header alone must
+                    // not buy the peer an allocation the size it declares.
+                    self.in_buffer.reserve(len.min(self.in_buf_max_read));
                 } else {
                     self.in_buffer.reserve(FrameHeader::MAX_SIZE);
                 }
@@ -229,11 +229,10 @@ impl FrameCodec {
         Ok(Some(frame))
     }
 
-    /// Read into available `in_buffer` capacity.
+    /// Read the next chunk into `in_buffer`, growing it as needed.
     fn read_in(&mut self, stream: &mut impl Read) -> io::Result<usize> {
         let len = self.in_buffer.len();
-        debug_assert!(self.in_buffer.capacity() > len);
-        self.in_buffer.resize(self.in_buffer.capacity().min(len + self.in_buf_max_read), 0);
+        self.in_buffer.resize(len + self.in_buf_max_read, 0);
         let size = stream.read(&mut self.in_buffer[len..]);
         self.in_buffer.truncate(len + size.as_ref().copied().unwrap_or(0));
         size
@@ -295,7 +294,7 @@ mod tests {
 
     use crate::error::{CapacityError, Error};
 
-    use super::{Frame, FrameSocket};
+    use super::{Frame, FrameCodec, FrameSocket};
 
     use std::io::Cursor;
 
@@ -361,5 +360,33 @@ mod tests {
             sock.read(Some(5)),
             Err(Error::Capacity(CapacityError::MessageTooLong { size: 7, max_size: 5 }))
         ));
+    }
+
+    fn frame_header(len: usize) -> Vec<u8> {
+        // FIN + binary, unmasked, 64-bit extended length.
+        let mut raw = vec![0x82, 0x7f];
+        raw.extend_from_slice(&(len as u64).to_be_bytes());
+        raw
+    }
+
+    #[test]
+    fn header_alone_reserves_a_chunk_not_the_declared_length() {
+        let declared = 2 * 1024 * 1024;
+        let mut stream = Cursor::new(frame_header(declared));
+        let mut codec = FrameCodec::new(8 * 1024);
+        assert!(codec.read_frame(&mut stream, None, false, true).unwrap().is_none());
+        assert!(codec.in_buffer.capacity() < declared);
+    }
+
+    #[test]
+    fn frame_larger_than_the_read_chunk_arrives_whole() {
+        let len = 1024 * 1024 + 1;
+        let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let mut raw = frame_header(len);
+        raw.extend_from_slice(&payload);
+        let mut stream = Cursor::new(raw);
+        let mut codec = FrameCodec::new(8 * 1024);
+        let frame = codec.read_frame(&mut stream, None, false, true).unwrap().unwrap();
+        assert_eq!(&frame.into_payload()[..], &payload[..]);
     }
 }
